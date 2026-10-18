@@ -1,0 +1,21 @@
+{
+  "stripe_account_id": "acct_REPLACE",
+  "livemode": false,
+  "start_date": "2026-01-01",
+  "timezone": "Europe/Amsterdam",
+  "odoo_url": "https://digitura.odoo.com",
+  "odoo_database": "digitura",
+  "company_id": 0,
+  "sales_journal_id": 0,
+  "income_account_id": 0,
+  "currencies": {"EUR": {"odoo_id": 0, "decimals": 2}},
+  "tax_map": {},
+  "no_tax": {"none": []},
+  "partner_map": {},
+  "income_account_map": {},
+  "post_invoices": false,
+  "sync_payments": false,
+  "receipt_ownership_confirmed": false,
+  "payment_journal_id": 0,
+  "payment_method_line_id": 0
+}

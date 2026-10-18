@@ -1,0 +1,9 @@
+__pycache__/
+*.sqlite3*
+*.lock
+config.local.json
+.venv/
+.ruff_cache/
+.env
+state/
+.DS_Store

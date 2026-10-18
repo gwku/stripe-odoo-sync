@@ -1,0 +1,64 @@
+name: Check and build Stripe Odoo sync
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the checked image to GHCR (main branch only)
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - run: python -m pip install ruff==0.17.1
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m unittest discover -s tests -v
+      - name: Validate image version
+        run: python -c "import pathlib, re; assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', pathlib.Path('VERSION').read_text().strip())"
+      - run: docker build -t stripe-odoo-sync:test .
+      - run: docker run --rm --read-only stripe-odoo-sync:test --help
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.publish
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "value=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/stripe-odoo-sync:${{ steps.version.outputs.value }}
+            ghcr.io/${{ github.repository_owner }}/stripe-odoo-sync:sha-${{ github.sha }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
