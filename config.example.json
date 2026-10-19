@@ -12,6 +12,7 @@
   "tax_map": {},
   "no_tax": {"none": []},
   "partner_map": {},
+  "document_map": {},
   "income_account_map": {},
   "post_invoices": false,
   "sync_payments": false,

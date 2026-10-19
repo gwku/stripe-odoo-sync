@@ -1,9 +1,11 @@
 import copy
 import io
+import re
 import sqlite3
 import tempfile
 import unittest
 import urllib.error
+from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -184,9 +186,20 @@ class FakeOdoo:
         }
         return fixtures[model]
 
-    def search(self, model, domain, fields, limit=100):
+    def search(self, model, domain, fields, limit=100, context=None):
         if model == "account.move.line":
             record = self.records["account.move", domain[0][2]]
+            if domain[1][2] == "product":
+                return [
+                    {
+                        **self.records["account.move.line", identifier],
+                        "price_subtotal": float(
+                            Decimal(str(self.records["account.move.line", identifier]["quantity"]))
+                            * Decimal(str(self.records["account.move.line", identifier]["price_unit"]))
+                        ),
+                    }
+                    for identifier in record["invoice_line_ids"]
+                ]
             return (
                 [
                     {
@@ -198,7 +211,35 @@ class FakeOdoo:
                 if record["_tax"]
                 else []
             )
-        return []
+
+        def matches(record):
+            tokens = iter(domain)
+
+            def evaluate():
+                token = next(tokens)
+                if token in ("|", "&"):
+                    left, right = evaluate(), evaluate()
+                    return left or right if token == "|" else left and right
+                field, operator, value = token
+                actual = record.get(field, False)
+                if operator == "=ilike":
+                    return str(actual or "").casefold() == str(value).casefold()
+                if operator == "ilike":
+                    pattern = ".*".join(re.escape(part) for part in str(value).split("%"))
+                    return bool(re.search(pattern, str(actual or ""), re.IGNORECASE))
+                return actual == value
+
+            results = []
+            while True:
+                try:
+                    results.append(evaluate())
+                except StopIteration:
+                    break
+            return all(results)
+
+        return [record for (kind, _), record in self.records.items() if kind == model and matches(record)][
+            :limit
+        ]
 
     def call(self, model, method, **args):
         self.actions.append((model, method, args))
@@ -413,7 +454,7 @@ class LedgerTests(unittest.TestCase):
         with patch("sys.stdout", new=io.StringIO()):
             self.assertEqual(main(["backup", "--state", str(self.path), "--output", str(backup)]), 0)
             self.assertEqual(main(["status", "--state", str(self.path)]), 0)
-        with sqlite3.connect(backup) as db:
+        with closing(sqlite3.connect(backup)) as db:
             self.assertEqual(db.execute("SELECT status FROM operations").fetchone()[0], "unknown")
 
 
@@ -507,6 +548,246 @@ class WorkerTests(unittest.TestCase):
         result = self.worker().run()
         self.assertEqual(result["verified"], 1)
         self.assertEqual(result["failed"], 1)
+
+
+class MatchingTests(unittest.TestCase):
+    worker = WorkerTests.worker
+
+    def setUp(self):
+        WorkerTests.setUp(self)
+        self.settings["partner_map"] = {}
+        self.stripe.invoices[0].update(
+            customer_email="billing@example.test",
+            customer_tax_ids=[{"type": "eu_vat", "value": "NL123456789B01"}],
+        )
+        self.odoo.records["res.partner", 6] = {
+            "id": 6,
+            "name": "Example",
+            "email": "billing@example.test",
+            "vat": "NL123456789B01",
+            "company_id": 1,
+            "active": True,
+        }
+
+    def external_invoice(self):
+        values, _ = document_plan(self.settings, invoice(), invoice(), [line()], 6)
+        target = self.odoo.create("account.move", values)
+        self.odoo.records["account.move", target].update(
+            ref=False,
+            name=f"INV/2026/{target}",
+            state="posted",
+        )
+        return target
+
+    def test_dry_run_links_existing_contacts_and_documents_without_remote_changes(self):
+        target = self.external_invoice()
+        before = copy.deepcopy(self.odoo.records)
+        result = self.worker(False).run()
+        self.assertEqual(result, {"contacts_linked": 1, "linked": 1})
+        self.assertEqual(self.odoo.records, before)
+        self.assertEqual(self.odoo.creates, 1)
+        self.assertEqual(self.odoo.actions, [])
+        self.assertEqual(self.ledger.db.execute("SELECT count(*) FROM operations").fetchone()[0], 0)
+        self.assertEqual(self.ledger.db.execute("SELECT target_id FROM document_links").fetchone()[0], target)
+        self.assertEqual(self.ledger.db.execute("SELECT target_id FROM contact_links").fetchone()[0], 6)
+
+    def test_apply_replays_local_links_without_creating_posting_or_rewriting_records(self):
+        target = self.external_invoice()
+        self.odoo.records["account.move", target]["state"] = "draft"
+        self.settings["post_invoices"] = True
+        before = copy.deepcopy(self.odoo.records)
+        self.worker(False).run()
+        self.assertEqual(self.worker().run()["linked"], 1)
+        self.assertEqual(self.worker().run()["linked"], 1)
+        self.assertEqual(self.odoo.records, before)
+        self.assertEqual(self.odoo.creates, 1)
+        self.assertEqual(self.odoo.actions, [])
+
+    def test_restored_snapshot_reuses_contact_and_invoice_links(self):
+        self.external_invoice()
+        self.worker(False).run()
+        backup = Path(self.temp.name) / "restored.sqlite3"
+        self.assertEqual(
+            main(
+                [
+                    "backup",
+                    "--state",
+                    str(Path(self.temp.name) / "state.sqlite3"),
+                    "--output",
+                    str(backup),
+                ]
+            ),
+            0,
+        )
+        with closing(Ledger(backup)) as restored:
+            result = Worker(self.settings, self.stripe, self.odoo, restored, apply=True).run()
+        self.assertEqual(result, {"contacts_linked": 1, "linked": 1})
+        self.assertEqual(self.odoo.creates, 1)
+        self.assertEqual(self.odoo.actions, [])
+
+    def test_manual_collapsed_quantities_and_different_descriptions_can_match(self):
+        target = self.external_invoice()
+        self.stripe.lines[0]["quantity"] = 2
+        self.odoo.records["account.move.line", target * 100]["name"] = "Manual description"
+        self.assertEqual(self.worker(False).run()["linked"], 1)
+
+    def test_duplicate_candidates_require_an_explicit_document_map(self):
+        self.external_invoice()
+        target = self.external_invoice()
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 2)
+        self.settings["document_map"] = {"in_test": target}
+        self.assertEqual(self.worker(False).run()["linked"], 1)
+
+    def test_explicit_document_mapping_still_requires_financial_verification(self):
+        target = self.external_invoice()
+        self.settings["document_map"] = {"in_test": target}
+        self.odoo.records["account.move.line", target * 100]["account_id"] = 99
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_incompatible_candidates_block_creation_instead_of_falling_back(self):
+        target = self.external_invoice()
+        mutations = [
+            ("account.move", target, "state", "cancel"),
+            ("account.move", target, "journal_id", 99),
+            ("account.move", target, "ref", "stripe:other:test:invoice:in_other"),
+            ("account.move", target, "_tax", 20),
+            ("account.move.line", target * 100, "account_id", 99),
+            ("account.move.line", target * 100, "tax_ids", [99]),
+            ("account.move.line", target * 100, "price_unit", 90),
+        ]
+        for model, identifier, field, value in mutations:
+            with self.subTest(field=field):
+                record = self.odoo.records[model, identifier]
+                previous = record.get(field)
+                record[field] = value
+                self.assertEqual(self.worker().run()["failed"], 1)
+                self.assertEqual(self.odoo.creates, 1)
+                self.assertEqual(self.odoo.actions, [])
+                record[field] = previous
+
+    def test_other_company_invoice_is_not_adopted(self):
+        target = self.external_invoice()
+        self.odoo.records["account.move", target]["company_id"] = 2
+        result = self.worker().run()
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(self.odoo.creates, 2)
+        self.assertEqual(self.ledger.db.execute("SELECT count(*) FROM document_links").fetchone()[0], 0)
+
+    def test_two_source_invoices_cannot_claim_one_existing_document(self):
+        self.external_invoice()
+        self.stripe.invoices.append({**self.stripe.invoices[0], "id": "in_other"})
+        result = self.worker().run()
+        self.assertEqual(result["linked"], 1)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_linked_record_changes_or_deletion_never_trigger_a_new_create(self):
+        target = self.external_invoice()
+        self.worker(False).run()
+        self.odoo.records["account.move.line", target * 100]["account_id"] = 99
+        self.assertEqual(self.worker().run()["failed"], 1)
+        del self.odoo.records["account.move", target]
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_remapping_an_existing_link_is_rejected(self):
+        self.external_invoice()
+        self.worker(False).run()
+        self.settings["document_map"] = {"in_test": 999}
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_unknown_write_intent_cannot_be_replaced_with_a_migration_match(self):
+        self.external_invoice()
+        ref = "stripe:acct_test:test:invoice:in_test"
+        self.ledger.put(ref, "unknown-fingerprint", "unknown")
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.ledger.get(ref)["status"], "unknown")
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_adopted_invoices_are_not_automatically_settled_or_cancelled(self):
+        self.external_invoice()
+        self.worker(False).run()
+        self.settings["sync_payments"] = True
+        with self.assertRaisesRegex(SyncError, "settlements_require_review"):
+            self.worker().invoice(self.stripe.invoices[0])
+        self.settings["sync_payments"] = False
+        self.stripe.invoices[0]["status"] = "void"
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.actions, [])
+
+    def test_adopted_credit_is_not_automatically_reconciled(self):
+        self.ledger.link("document", "stripe:acct_test:test:credit:cn_test", 12, "hash")
+        with self.assertRaisesRegex(SyncError, "linked_credit_settlement"):
+            self.worker().reconcile_credit(
+                {"id": "cn_test", "total": 12100, "pre_payment_amount": 12100}, 12, 11
+            )
+        self.assertEqual(self.odoo.actions, [])
+
+    def test_vat_and_name_match_reuses_contact_with_a_different_email(self):
+        self.odoo.records["res.partner", 6]["email"] = "old@example.test"
+        self.assertEqual(self.worker().run()["contacts_linked"], 1)
+        self.assertEqual(self.odoo.creates, 1)  # Invoice only.
+
+    def test_name_and_email_match_is_case_insensitive(self):
+        self.stripe.invoices[0]["customer_tax_ids"] = []
+        self.odoo.records["res.partner", 6].update(name="EXAMPLE", email="BILLING@example.test")
+        self.assertEqual(self.worker().run()["contacts_linked"], 1)
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_shared_email_without_matching_name_does_not_merge_or_create(self):
+        self.odoo.records["res.partner", 6]["name"] = "Different business"
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_conflicting_vat_numbers_do_not_merge_or_create(self):
+        self.odoo.records["res.partner", 6]["vat"] = "NL999999999B01"
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_formatted_vat_with_changed_name_is_reviewed_instead_of_duplicated(self):
+        self.odoo.records["res.partner", 6].update(
+            name="Example Limited",
+            email=False,
+            vat="NL 123.456.789 B01",
+        )
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_unknown_contact_create_cannot_be_replaced_by_a_migration_match(self):
+        self.ledger.put("stripe:acct_test:test:customer:cus_test", "unknown", "unknown")
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_name_only_match_requires_review_instead_of_creating_a_contact(self):
+        self.odoo.records["res.partner", 6].update(email="other@example.test", vat=False)
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_ambiguous_and_archived_contacts_are_not_duplicated(self):
+        self.odoo.records["res.partner", 7] = {**self.odoo.records["res.partner", 6], "id": 7}
+        self.assertEqual(self.worker().run()["failed"], 1)
+        del self.odoo.records["res.partner", 7]
+        self.odoo.records["res.partner", 6]["active"] = False
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_linked_contact_changes_and_deleted_contact_do_not_create_replacements(self):
+        self.worker(False).run()
+        self.stripe.invoices[0]["customer_name"] = "Changed name"
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.stripe.invoices[0]["customer_name"] = "Example"
+        del self.odoo.records["res.partner", 6]
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_new_contact_is_created_only_when_no_possible_existing_contact_is_found(self):
+        self.odoo.records.clear()
+        result = self.worker().run()
+        self.assertEqual(result["verified"], 1)
+        self.assertEqual(self.odoo.creates, 2)  # One contact, one invoice.
 
 
 class HttpTests(unittest.TestCase):

@@ -70,6 +70,11 @@ def main(argv=None):
                     "SELECT reference, status, target_id FROM operations WHERE status != 'succeeded'"
                 ).fetchall()
                 log("pending_operations", operations=[dict(row) for row in rows])
+                for kind in ("document", "contact"):
+                    rows = ledger.db.execute(
+                        f"SELECT reference, target_id, linked_at FROM {kind}_links ORDER BY reference"
+                    ).fetchall()
+                    log(kind + "_links", links=[dict(row) for row in rows])
                 return 0
             config = load_config(args.config)
             key, odoo_key = os.getenv("STRIPE_API_KEY"), os.getenv("ODOO_API_KEY")

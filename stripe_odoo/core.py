@@ -90,6 +90,12 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS resolutions (
                 id INTEGER PRIMARY KEY, reference TEXT NOT NULL,
                 resolved_at INTEGER NOT NULL, reason TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS document_links (
+                reference TEXT PRIMARY KEY, target_id INTEGER NOT NULL UNIQUE,
+                fingerprint TEXT NOT NULL, linked_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS contact_links (
+                reference TEXT PRIMARY KEY, target_id INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL, linked_at INTEGER NOT NULL);
         """)
         self.db.commit()
 
@@ -107,6 +113,40 @@ class Ledger:
 
     def get(self, ref):
         return self.db.execute("SELECT * FROM operations WHERE reference=?", (ref,)).fetchone()
+
+    def link(self, kind, ref, target_id, fingerprint):
+        require(kind in ("document", "contact"), "invalid_link_kind")
+        previous = self.linked(kind, ref)
+        if previous:
+            require(previous["target_id"] == target_id, "existing_link_target_changed")
+            require(previous["fingerprint"] == fingerprint, "existing_link_payload_changed")
+            return
+        if kind == "document":
+            claimed = self.db.execute(
+                "SELECT reference FROM document_links WHERE target_id=?", (target_id,)
+            ).fetchone()
+            require(not claimed, "odoo_document_already_linked_to_other_source")
+            operations = self.db.execute(
+                "SELECT reference FROM operations WHERE target_id=?", (target_id,)
+            ).fetchall()
+            require(
+                not any(
+                    (":invoice:" in row[0] or ":credit:" in row[0])
+                    and row[0] != ref
+                    and not row[0].startswith(ref + ":")
+                    for row in operations
+                ),
+                "odoo_document_already_owned_by_other_source",
+            )
+        with self.db:
+            self.db.execute(
+                f"INSERT INTO {kind}_links VALUES (?, ?, ?, ?)",
+                (ref, target_id, fingerprint, int(time.time())),
+            )
+
+    def linked(self, kind, ref):
+        require(kind in ("document", "contact"), "invalid_link_kind")
+        return self.db.execute(f"SELECT * FROM {kind}_links WHERE reference=?", (ref,)).fetchone()
 
     def put(self, ref, fingerprint, status, target_id=None):
         with self.db:
@@ -273,8 +313,16 @@ class Odoo:
             f"{self.url}/json/2/{model}/{method}", self.headers, {**args, "context": context}, safe=safe
         )
 
-    def search(self, model, domain, fields, limit=100):
-        return self.call(model, "search_read", safe=True, domain=domain, fields=fields, limit=limit)
+    def search(self, model, domain, fields, limit=100, context=None):
+        return self.call(
+            model,
+            "search_read",
+            safe=True,
+            domain=domain,
+            fields=fields,
+            limit=limit,
+            context=context or {},
+        )
 
     def one(self, model, identifier, fields):
         records = self.search(model, [["id", "=", identifier]], fields, limit=2)

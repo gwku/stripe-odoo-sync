@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 
 from .core import Rejected, SyncError, date_of, digest, log, minor, object_id, relation_id, require
+from .matching import Matcher
 from .planning import document_plan, reference
 
 
@@ -96,14 +97,16 @@ class Worker:
         source_id = object_id(invoice.get("customer"))
         require(bool(source_id), "stripe_customer_required")
         mapped = self.config.get("partner_map", {}).get(source_id)
+        ref = reference(self.config, "customer", source_id)
         if mapped:
+            linked = self.ledger.linked("contact", ref)
+            require(not linked or linked["target_id"] == mapped, "existing_link_target_changed")
             partner = self.odoo.one("res.partner", mapped, ["company_id"])
             require(
                 relation_id(partner["company_id"]) in (False, self.config["company_id"]),
                 "partner_company_mismatch",
             )
             return mapped
-        ref = reference(self.config, "customer", source_id)
         address = invoice.get("customer_address") or {}
         values = {
             "name": invoice.get("customer_name") or source_id,
@@ -125,6 +128,14 @@ class Worker:
         if vats:
             values["vat"] = vats[0]
         existing = self.find("res.partner", ref)
+        linked = self.ledger.linked("contact", ref)
+        require(not existing or not linked or existing == linked["target_id"], "existing_link_target_changed")
+        if not existing:
+            matched = Matcher(self.config, self.odoo, self.ledger).contact(ref, values)
+            if matched:
+                self.counts["contacts_linked"] += 1
+                log("existing_contact_linked", source_id=source_id, target_id=matched)
+                return matched
         if not self.apply:
             return existing or -1
         # Freeze the first imported contact snapshot. Later snapshot changes require an explicit partner_map.
@@ -240,6 +251,22 @@ class Worker:
         fingerprint = digest(
             {"values": {k: v for k, v in values.items() if k != "narration"}, "expected": expected}
         )
+        managed = self.find("account.move", ref)
+        linked = self.ledger.linked("document", ref)
+        mapped = self.config.get("document_map", {}).get(source["id"])
+        require(not managed or not linked or managed == linked["target_id"], "existing_link_target_changed")
+        require(not managed or not mapped or managed == mapped, "existing_link_target_changed")
+        if linked or not managed:
+            existing = Matcher(self.config, self.odoo, self.ledger).document(source, values, expected)
+            if existing:
+                self.counts["linked"] += 1
+                log(
+                    "existing_document_linked",
+                    source_id=source["id"],
+                    target_id=existing,
+                    mode="apply" if self.apply else "dry-run",
+                )
+                return existing
         if not self.apply:
             self.counts["previewed"] += 1
             log(
@@ -248,7 +275,7 @@ class Worker:
                 total_minor=expected["total"],
                 currency=source["currency"],
             )
-            return self.find("account.move", ref) or -1
+            return managed or -1
         identifier = self.ledger.ensure(
             ref,
             fingerprint,
@@ -270,6 +297,7 @@ class Worker:
 
     def void(self, source, kind):
         ref = reference(self.config, kind, source["id"])
+        require(not self.ledger.linked("document", ref), "linked_document_void_requires_review")
         identifier = self.find("account.move", ref)
         if not identifier:
             require(not self.ledger.get(ref), "voided_document_result_missing")
@@ -294,6 +322,10 @@ class Worker:
             and not credit.get("customer_balance_transaction")
             and not credit.get("post_payment_amount"),
             "post_payment_credit_or_customer_balance_requires_review",
+        )
+        require(
+            not self.ledger.linked("document", reference(self.config, "credit", credit["id"])),
+            "linked_credit_settlement_requires_review",
         )
         if not self.apply:
             return
@@ -468,6 +500,11 @@ class Worker:
         invoice["_lines"] = list(self.stripe.list(f"/v1/invoices/{invoice['id']}/lines"))
         partner = self.partner(invoice)
         move_id = self.document(invoice, invoice, invoice["_lines"], partner)
+        require(
+            not self.config.get("sync_payments")
+            or not self.ledger.linked("document", reference(self.config, "invoice", invoice["id"])),
+            "linked_invoice_settlements_require_review",
+        )
         for credit in self.stripe.list("/v1/credit_notes", {"invoice": invoice["id"]}):
             if credit["status"] == "void":
                 self.void(credit, "credit")

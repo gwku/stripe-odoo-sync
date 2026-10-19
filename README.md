@@ -6,7 +6,7 @@ This standalone repository owns the worker, tests, and container image. Deployme
 configuration and rollout instructions remain in the sibling `digitura-iac`
 checkout at `deploy/projects/custom/stripe-odoo-sync/README.md`.
 
-The repository is local for now: no GitHub repository or image has been published.
+Source: [gwku/stripe-odoo-sync](https://github.com/gwku/stripe-odoo-sync).
 
 ## Behavior
 
@@ -64,18 +64,44 @@ example's IDs and date are examples, not Digitura's accounting setup. Fill in:
 | `tax_map` | Stripe tax-rate ID to existing Odoo tax ID, e.g. `{"txr_example": 42}`. |
 | `no_tax` | Explicit treatment to Odoo tax-ID list. `{"none": []}` deliberately accepts ordinary untaxed sales; exempt and reverse-charge treatments require reporting tax IDs. |
 | `partner_map` | Optional Stripe customer ID to an existing Odoo partner ID. Use for migration matches and changed historical customer snapshots. |
+| `document_map` | Optional Stripe invoice/credit-note ID to an existing Odoo move ID, to resolve ambiguous migration matches. Financial verification still applies. |
 | `income_account_map` | Optional Stripe product ID to an Odoo income account ID; otherwise use the configured income account. |
 | `post_invoices`, `sync_payments` | Boolean opt-ins, both false initially. |
 
+Contacts first use explicit mappings and existing connector references. Otherwise,
+the worker searches the intended company and shared contacts, including archived
+records. A unique match requires the same normalized name plus VAT number or
+email, without conflicting VAT numbers. Name-only, email-only, conflicting,
+ambiguous, and archived matches stop for review; no replacement contact is created.
+It creates a new contact only when no possible existing contact is found.
+
 Auto-created contacts use the finalized invoice's name, address, and EU VAT ID.
 The first snapshot is frozen. A later differing snapshot requires an explicit
-`partner_map`; the worker never merges by email or overwrites an existing contact.
+`partner_map`. Existing contacts are reused without overwriting their details.
 Original document numbers and Stripe PDF links are stored on the Odoo move;
 Odoo keeps its own document sequence. PDF bytes are not archived by this worker.
 
-Existing Odoo documents are matched only by the connector's deterministic
-reference. Review existing invoices and choose the cutoff before importing:
-the worker does not guess matches by amount or invoice number.
+Existing documents first use saved links or the connector's deterministic
+reference. For manually entered invoices, automatic matching requires a unique
+match on company, customer, invoice type, currency, issue date, net amount, and
+total. The worker then verifies the sales journal, the complete multiset of line
+net amounts/accounts/tax IDs, and actual tax amounts per tax ID. It permits
+different descriptions, line order, and collapsed quantities in a manual invoice
+when those financial details agree. Credit notes also need the correct original
+invoice link. Ambiguous or incompatible candidates stop for review instead of
+creating another invoice. An explicit `document_map` resolves ambiguity but cannot
+bypass financial verification.
+
+Contact and document links are stored in SQLite, including during dry runs.
+Existing Odoo references, document numbers, lines, and contact details stay intact.
+Each Odoo document can belong to only one Stripe document within this ledger.
+Every replay revalidates the linked target; a missing or changed target never
+falls back to creating a replacement. Uncertain write intents cannot be overridden
+by migration matching. Preserve and back up the ledger for scheduled runs.
+
+Adopted invoices and credits are not automatically posted, cancelled, or settled.
+Enabling receipt import for a linked invoice, reconciling a linked credit, or
+voiding a linked source stops for review so existing accounting is not duplicated.
 
 Set `STRIPE_API_KEY` and `ODOO_API_KEY` through the environment. Stripe requires
 read access to Account, Balance, Invoices/lines, Credit Notes/lines, Invoice
@@ -150,20 +176,20 @@ docker build -t stripe-odoo-sync:test .
 docker run --rm --read-only stripe-odoo-sync:test --help
 ```
 
-These tests cover local accounting normalization, replay and crash recovery,
-partial receipts, unsafe wizard rejection, pagination, locks, and backup integrity.
+These tests cover local accounting normalization, migration matching, contact
+reuse, ambiguous/changed/deleted targets, replay and crash recovery, partial
+receipts, unsafe wizard rejection, pagination, locks, and backup integrity.
 They do not replace accounting verification against an Odoo 19 test database.
 
 ## Image releases
 
 The included workflow checks pull requests and pushes to `main`. Publishing is
-an explicit manual workflow run with `publish` enabled, after a GitHub repository
-has been created. It builds amd64 and arm64 images under
-`ghcr.io/<repository-owner>/stripe-odoo-sync`, tagged with `VERSION` and
+an explicit manual workflow run with `publish` enabled. It builds amd64 and arm64 images under
+`ghcr.io/gwku/stripe-odoo-sync`, tagged with `VERSION` and
 `sha-<full Git commit>`. Pushes to `main` only check and build locally in CI.
 
-Keep the repository name `stripe-odoo-sync` and use the `digitura-dev` owner for
-the image path already configured in Digitura's deployment. Pin the production
+Keep the repository name `stripe-odoo-sync` and the `gwku` owner for
+the image path configured in Digitura's deployment. Pin the production
 overlay to a published commit tag or image digest. The version tag is a build
 alias; do not rely on it as immutable. Deployment and Prometheus checks run
 separately in `digitura-iac`. Local tests never push an image.
