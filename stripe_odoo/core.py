@@ -279,6 +279,11 @@ class Stripe:
         # Account objects need not expose livemode. Balance does and verifies even an empty account.
         require(self.get("/v1/balance")["livemode"] == self.live, "stripe_mode_mismatch")
 
+    def pdf(self, source):
+        from .pdf import download_pdf
+
+        return download_pdf(self.http, source.get("pdf") or source.get("invoice_pdf"))
+
 
 class Odoo:
     def __init__(self, url, database, key, company_id, http):
@@ -296,7 +301,7 @@ class Odoo:
         self.headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
-            "User-Agent": "digitura-stripe-odoo-sync/1.0",
+            "User-Agent": "stripe-odoo-sync/1.0",
         }
         if database:
             self.headers["X-Odoo-Database"] = database
@@ -381,8 +386,8 @@ def load_config(path):
             "configure_currency_id_and_decimals",
         )
     require(not config.get("sync_payments") or config.get("post_invoices"), "payments_require_posting")
-    for key in ("post_invoices", "sync_payments", "receipt_ownership_confirmed"):
-        require(type(config.get(key, False)) is bool, f"invalid_{key}")
+    for key in ("post_invoices", "sync_payments", "receipt_ownership_confirmed", "sync_pdfs"):
+        require(type(config.get(key, key == "sync_pdfs")) is bool, f"invalid_{key}")
     if config.get("sync_payments"):
         require(config.get("receipt_ownership_confirmed") is True, "confirm_receipt_import_ownership")
         for key in ("payment_journal_id", "payment_method_line_id"):

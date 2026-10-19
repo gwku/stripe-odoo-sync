@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from .core import Rejected, SyncError, date_of, digest, log, minor, object_id, relation_id, require
 from .matching import Matcher
+from .pdf import PDFStore, validate_pdf
 from .planning import document_plan, reference
 
 
@@ -497,9 +498,12 @@ class Worker:
             self.void(invoice, "invoice")
             return
         require(invoice["status"] in ("open", "paid", "uncollectible"), "unsupported_invoice_status")
+        pdf = self.fetch_pdf(invoice)
         invoice["_lines"] = list(self.stripe.list(f"/v1/invoices/{invoice['id']}/lines"))
         partner = self.partner(invoice)
         move_id = self.document(invoice, invoice, invoice["_lines"], partner)
+        if pdf is not None:
+            self.attach_pdf(invoice, move_id, pdf)
         require(
             not self.config.get("sync_payments")
             or not self.ledger.linked("document", reference(self.config, "invoice", invoice["id"])),
@@ -510,8 +514,11 @@ class Worker:
                 self.void(credit, "credit")
                 continue
             require(credit["status"] == "issued", "unsupported_credit_status")
+            pdf = self.fetch_pdf(credit)
             lines = list(self.stripe.list(f"/v1/credit_notes/{credit['id']}/lines"))
             credit_id = self.document(credit, invoice, lines, partner, move_id)
+            if pdf is not None:
+                self.attach_pdf(credit, credit_id, pdf)
             if self.config.get("sync_payments"):
                 self.reconcile_credit(credit, credit_id, move_id)
         if self.config.get("sync_payments"):
@@ -519,6 +526,20 @@ class Worker:
         if invoice["status"] == "uncollectible":
             log("accountant_review", source_id=invoice["id"], code="bad_debt_policy_required")
             self.counts["review"] += 1
+
+    def attach_pdf(self, source, move_id, data):
+        identifier, status = PDFStore(self.config, self.odoo, self.ledger).sync(
+            source, move_id, data, self.apply
+        )
+        self.counts["pdfs_" + status] += 1
+        log("source_pdf_" + status, source_id=source["id"], target_id=identifier)
+
+    def fetch_pdf(self, source):
+        if not self.config.get("sync_pdfs", True):
+            return None
+        data = self.stripe.pdf(source)
+        validate_pdf(data)
+        return data
 
     def run(self, cutoff=None):
         self.preflight()

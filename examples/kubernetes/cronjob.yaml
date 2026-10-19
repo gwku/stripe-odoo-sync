@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: stripe-odoo-sync
+spec:
+  schedule: "0 6 * * 1"
+  timeZone: Etc/UTC
+  suspend: true
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 600
+      ttlSecondsAfterFinished: 604800
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: sync
+              image: ghcr.io/gwku/stripe-odoo-sync:1.0.0
+              args: [sync]
+              env:
+                - {name: SYNC_MODE, value: dry-run}
+              envFrom:
+                - secretRef: {name: stripe-odoo-credentials}
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: "1", memory: 256Mi}
+              volumeMounts:
+                - {name: state, mountPath: /state}
+                - {name: config, mountPath: /config, readOnly: true}
+          volumes:
+            - name: state
+              persistentVolumeClaim: {claimName: stripe-odoo-state}
+            - name: config
+              configMap: {name: stripe-odoo-config}

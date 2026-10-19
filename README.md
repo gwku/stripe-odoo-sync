@@ -1,12 +1,94 @@
-# Stripe to Odoo sync worker
+# Stripe to Odoo sync
 
-Dependency-free Python 3.13 worker using Stripe's REST API and Odoo 19 JSON-2.
-The Kubernetes deployment runs weekly on Monday at 06:00 Amsterdam time.
-This standalone repository owns the worker, tests, and container image. Deployment
-configuration and rollout instructions remain in the sibling `digitura-iac`
-checkout at `deploy/projects/custom/stripe-odoo-sync/README.md`.
+Stripe issues my invoices and collects payments; Odoo is where I keep the
+accounts. This project moves the issued documents into Odoo without having to
+enter the same invoice twice. It also recognises invoices and contacts that
+were entered manually before the integration existed.
 
-Source: [gwku/stripe-odoo-sync](https://github.com/gwku/stripe-odoo-sync).
+It is a Python 3.13 command-line worker, packaged as a Docker image. A run
+checks Stripe for invoices and credit notes, validates their accounting mappings,
+reuses or creates the corresponding Odoo records, saves the original PDFs, and
+exits. SQLite keeps the links and operation history between runs.
+
+I run it as a **weekly Kubernetes CronJob**, with a persistent volume for SQLite,
+secrets supplied by a secret manager, and daily state/configuration backups to
+AWS S3. That is one way to operate it: you can run the same worker directly with
+Python, Docker, cron, a systemd timer, or another job runner with persistent state.
+
+This repository contains the worker, Dockerfile, tests, image-build workflow,
+and a [generic Kubernetes example](examples/kubernetes/README.md). My production
+manifests, secret-manager integration, monitoring rules, and AWS configuration
+live in a separate infrastructure repository and are not included here.
+
+## Quick start with Python
+
+Requirements: Python 3.13 or newer on Linux/macOS, Stripe API access, and an
+Odoo 19 database with external API access and an integration user. The worker
+uses Stripe's REST API and Odoo's JSON-2 API. It uses only the Python standard library.
+
+```sh
+git clone https://github.com/gwku/stripe-odoo-sync.git
+cd stripe-odoo-sync
+python3 -m venv .venv
+. .venv/bin/activate
+cp config.example.json config.local.json
+```
+
+Fill in `config.local.json` with your own account, company, journal, revenue,
+currency, and tax mappings. Supply `STRIPE_API_KEY` and `ODOO_API_KEY` through
+your environment or secret manager. Credentials do not belong in the JSON file.
+
+```sh
+python -m stripe_odoo sync --mode dry-run \
+  --config config.local.json --state ./state/ledger.sqlite3
+
+# Create real Odoo records after checking your mappings.
+python -m stripe_odoo sync --mode apply \
+  --config config.local.json --state ./state/ledger.sqlite3
+```
+
+`apply` creates drafts unless `post_invoices` is enabled. Payment registration is
+a separate option. A dry run makes no Odoo writes, but can persist verified links
+in the local ledger. Use the **same ledger** for subsequent runs and back it up.
+
+## Run with Docker
+
+The image is published as `ghcr.io/gwku/stripe-odoo-sync` for amd64 and arm64.
+Registry access is required if the package is private. You can also build it:
+
+```sh
+docker build -t stripe-odoo-sync:local .
+mkdir -p state
+docker run --rm --read-only \
+  --user "$(id -u):$(id -g)" \
+  -e STRIPE_API_KEY -e ODOO_API_KEY \
+  --mount "type=bind,src=$PWD/config.local.json,dst=/config/config.json,readonly" \
+  --mount "type=bind,src=$PWD/state,dst=/state" \
+  stripe-odoo-sync:local sync --mode apply
+```
+
+The default image user is UID/GID `10001`. The local example above uses your host
+UID/GID to write the mounted state directory. In a scheduler, give the container
+write access to `/state` and mount `/config/config.json` read-only. Keep API keys
+injected at runtime. Pin a published commit tag or image digest for deployments.
+
+## Run in Kubernetes
+
+The [example setup](examples/kubernetes/README.md) supplies a namespace, PVC,
+ConfigMap generation, and CronJob. It explains how to supply credentials and
+activate a schedule using your own configuration. It is deliberately generic:
+it does not contain my company's accounting mappings, private hosts, secrets,
+or cloud storage settings.
+
+In my deployment, the sync uses `concurrencyPolicy: Forbid`, automatic write
+retries are disabled, and scheduled/manual jobs share the same state volume and
+file lock. A separate daily job runs the backup command, uploads the consistent
+snapshot and configuration to S3, then downloads both files and verifies their
+checksums. Monitoring checks failed and overdue jobs.
+
+You do not need that infrastructure to run the worker. The operational contract
+is the same everywhere: retain the ledger, allow one writer at a time, preserve
+the configuration, and keep a restorable backup outside the worker's machine.
 
 ## Behavior
 
@@ -53,7 +135,7 @@ unsuccessfully so partial failure remains visible.
 ## Configuration
 
 Copy `config.example.json` to ignored `config.local.json` for local work. The
-example's IDs and date are examples, not Digitura's accounting setup. Fill in:
+example's IDs and date are placeholders, not an accounting configuration. Fill in:
 
 | Setting | Meaning |
 | --- | --- |
@@ -67,6 +149,7 @@ example's IDs and date are examples, not Digitura's accounting setup. Fill in:
 | `document_map` | Optional Stripe invoice/credit-note ID to an existing Odoo move ID, to resolve ambiguous migration matches. Financial verification still applies. |
 | `income_account_map` | Optional Stripe product ID to an Odoo income account ID; otherwise use the configured income account. |
 | `post_invoices`, `sync_payments` | Boolean opt-ins, both false initially. |
+| `sync_pdfs` | Preserve original invoice and credit-note PDFs as Odoo attachments; true by default. |
 
 Contacts first use explicit mappings and existing connector references. Otherwise,
 the worker searches the intended company and shared contacts, including archived
@@ -79,7 +162,13 @@ Auto-created contacts use the finalized invoice's name, address, and EU VAT ID.
 The first snapshot is frozen. A later differing snapshot requires an explicit
 `partner_map`. Existing contacts are reused without overwriting their details.
 Original document numbers and Stripe PDF links are stored on the Odoo move;
-Odoo keeps its own document sequence. PDF bytes are not archived by this worker.
+Odoo keeps its own document sequence. Original PDF bytes are saved as private
+attachments on the corresponding Odoo move, including matched existing invoices.
+A saved attachment reference prevents repeat uploads. Existing invoice attachments
+named `Invoice-<Stripe invoice number>.pdf` are also reused on the matched Odoo
+invoice. Downloads are limited to 8 MiB and checked for a PDF header before
+creating accounting records. The ledger tracks attachment writes and recovers
+responses lost after upload. Missing or altered saved attachments stop for review.
 
 Existing documents first use saved links or the connector's deterministic
 reference. For manually entered invoices, automatic matching requires a unique
@@ -102,12 +191,13 @@ by migration matching. Preserve and back up the ledger for scheduled runs.
 Adopted invoices and credits are not automatically posted, cancelled, or settled.
 Enabling receipt import for a linked invoice, reconciling a linked credit, or
 voiding a linked source stops for review so existing accounting is not duplicated.
+Archiving a missing original PDF is allowed independently of those accounting actions.
 
 Set `STRIPE_API_KEY` and `ODOO_API_KEY` through the environment. Stripe requires
 read access to Account, Balance, Invoices/lines, Credit Notes/lines, Invoice
 Payments, PaymentIntents when importing receipts, and Balance Transactions when
 running settlement reports. Use an Odoo integration user scoped to the company
-with contact and accounting permissions, and track its API key expiry. External
+with contact, accounting, and attachment permissions, and track its API key expiry. External
 API entitlement is required on the Odoo subscription.
 
 ## Commands
@@ -189,7 +279,7 @@ an explicit manual workflow run with `publish` enabled. It builds amd64 and arm6
 `sha-<full Git commit>`. Pushes to `main` only check and build locally in CI.
 
 Keep the repository name `stripe-odoo-sync` and the `gwku` owner for
-the image path configured in Digitura's deployment. Pin the production
+your deployment's image path. Pin the production
 overlay to a published commit tag or image digest. The version tag is a build
 alias; do not rely on it as immutable. Deployment and Prometheus checks run
-separately in `digitura-iac`. Local tests never push an image.
+in the separate infrastructure repository. Local tests never push an image.

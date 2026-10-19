@@ -1,4 +1,6 @@
+import base64
 import copy
+import hashlib
 import io
 import re
 import sqlite3
@@ -39,6 +41,7 @@ def config():
         "tax_map": {"txr_vat": 5},
         "no_tax": {"none": []},
         "partner_map": {"cus_test": 6},
+        "sync_pdfs": False,
     }
 
 
@@ -132,6 +135,13 @@ class FakeOdoo:
         identifier = self.creates + 10
         record = copy.deepcopy(values)
         record["id"] = identifier
+        if model == "ir.attachment":
+            data = base64.b64decode(record.pop("datas"))
+            record.update(
+                raw=base64.b64encode(data).decode(),
+                file_size=len(data),
+                checksum=hashlib.sha1(data).hexdigest(),
+            )
         if model == "account.move":
             net = sum(
                 Decimal(str(item[2]["price_unit"])) * Decimal(str(item[2]["quantity"]))
