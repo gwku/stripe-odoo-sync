@@ -136,7 +136,9 @@ class FakeOdoo:
         record = copy.deepcopy(values)
         record["id"] = identifier
         if model == "ir.attachment":
-            data = base64.b64decode(record.pop("datas"))
+            # Mirror Odoo 19: "datas" is silently dropped on create, only "raw" stores content.
+            record.pop("datas", None)
+            data = base64.b64decode(record.pop("raw", ""))
             record.update(
                 raw=base64.b64encode(data).decode(),
                 file_size=len(data),
@@ -749,6 +751,18 @@ class MatchingTests(unittest.TestCase):
 
     def test_shared_email_without_matching_name_does_not_merge_or_create(self):
         self.odoo.records["res.partner", 6]["name"] = "Different business"
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_nameless_customer_links_a_unique_mailbox_match(self):
+        self.stripe.invoices[0].update(customer_name=None, customer_tax_ids=[])
+        self.odoo.records["res.partner", 6]["vat"] = False
+        self.assertEqual(self.worker().run()["contacts_linked"], 1)
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_nameless_customer_with_ambiguous_mailbox_match_is_reviewed(self):
+        self.stripe.invoices[0].update(customer_name=None, customer_tax_ids=[])
+        self.odoo.records["res.partner", 7] = {**self.odoo.records["res.partner", 6], "id": 7}
         self.assertEqual(self.worker().run()["failed"], 1)
         self.assertEqual(self.odoo.creates, 0)
 

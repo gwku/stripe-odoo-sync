@@ -136,7 +136,8 @@ class PDFStore:
                     "res_model": "account.move",
                     "res_id": move_id,
                     "company_id": self.config["company_id"],
-                    "datas": base64.b64encode(data).decode("ascii"),
+                    # Odoo 19 ignores "datas" on create (empty attachment); "raw" stores the file.
+                    "raw": base64.b64encode(data).decode("ascii"),
                 },
             )
 

@@ -132,7 +132,9 @@ class Worker:
         linked = self.ledger.linked("contact", ref)
         require(not existing or not linked or existing == linked["target_id"], "existing_link_target_changed")
         if not existing:
-            matched = Matcher(self.config, self.odoo, self.ledger).contact(ref, values)
+            matched = Matcher(self.config, self.odoo, self.ledger).contact(
+                ref, values, named=bool(invoice.get("customer_name"))
+            )
             if matched:
                 self.counts["contacts_linked"] += 1
                 log("existing_contact_linked", source_id=source_id, target_id=matched)

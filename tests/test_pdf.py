@@ -89,7 +89,7 @@ class PDFStoreTests(unittest.TestCase):
                 "type": "binary",
                 "mimetype": "application/pdf",
                 "public": False,
-                "datas": base64.b64encode(pdf(metadata="manual-original")).decode(),
+                "raw": base64.b64encode(pdf(metadata="manual-original")).decode(),
             },
         )
         before = dict(self.odoo.records["ir.attachment", existing])
