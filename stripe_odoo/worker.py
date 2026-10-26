@@ -273,10 +273,12 @@ class Worker:
             for discount in line.get("discounts") or []:
                 if not isinstance(discount, dict) or discount["id"] in labels:
                     continue
-                coupon = (discount.get("source") or {}).get("coupon")
+                # The pinned API version embeds the coupon; newer ones reference it from "source".
+                coupon = discount.get("coupon") or (discount.get("source") or {}).get("coupon")
                 label = "Discount"
                 try:
-                    coupon = self.stripe.get(f"/v1/coupons/{object_id(coupon)}") if coupon else None
+                    if coupon and not isinstance(coupon, dict):
+                        coupon = self.stripe.get(f"/v1/coupons/{object_id(coupon)}")
                 except SyncError:
                     coupon = None  # Restricted API keys may not read coupons.
                 if coupon and coupon.get("name"):

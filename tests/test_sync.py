@@ -630,11 +630,15 @@ class DiscountTests(unittest.TestCase):
                 "discounts": [
                     {"id": "di_ok", "source": {"coupon": "ok"}},
                     {"id": "di_hidden", "source": {"coupon": "hidden"}},
+                    {"id": "di_embedded", "coupon": {"name": "HALF", "percent_off": 50}},
                     "di_not_expanded",
                 ]
             }
         ]
-        self.assertEqual(worker.discount_labels(lines), {"di_ok": "FREE (100% off)", "di_hidden": "Discount"})
+        self.assertEqual(
+            worker.discount_labels(lines),
+            {"di_ok": "FREE (100% off)", "di_hidden": "Discount", "di_embedded": "HALF (50% off)"},
+        )
 
     def test_inclusive_tax_discounts_stay_netted(self):
         source = {**invoice(), "total_excluding_tax": 6198, "total": 7500}
