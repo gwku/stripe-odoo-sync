@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import re
 from collections import defaultdict
 from decimal import Decimal
 
@@ -88,7 +89,12 @@ def document_plan(config, source, invoice, lines, partner_id, original_move_id=N
             )
         account_id = config.get("income_account_map", {}).get(product, config["income_account_id"])
         description = line.get("description") or line["id"]
-        period = line.get("period")
+        period = None
+        if (line.get("parent") or {}).get("type") == "subscription_item_details":
+            # Stripe's API wraps subscription lines as "1 × Name (at €9.00 / month)"; its PDF shows just the name.
+            wrapped = re.fullmatch(r"\d+ × (.+) \([^()]*\)", description)
+            description = wrapped.group(1) if wrapped else description
+            period = line.get("period")
         if period:
             description += f" [{date_of(period['start'], config['timezone'])} to {date_of(period['end'], config['timezone'])}]"
         commands.append(

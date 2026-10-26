@@ -564,6 +564,30 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["failed"], 1)
 
 
+class DescriptionTests(unittest.TestCase):
+    def names(self, **changes):
+        item = {**line(), "period": {"start": 1767222000, "end": 1769900400}, **changes}
+        values, _ = document_plan(config(), invoice(), invoice(), [item], 6)
+        return [command[2]["name"] for command in values["invoice_line_ids"]]
+
+    def test_one_off_line_keeps_stripe_description_without_period(self):
+        self.assertEqual(
+            self.names(description="Hours (uren, 24 oktober 2026)"), ["Hours (uren, 24 oktober 2026)"]
+        )
+
+    def test_subscription_line_uses_pdf_name_and_adds_period(self):
+        parent = {"parent": {"type": "subscription_item_details"}}
+        for description in ("1 × Zorgeloos (voor €139.00 / maand)", "1 × Zorgeloos (at €139.00 / month)"):
+            self.assertEqual(
+                self.names(description=description, **parent),
+                ["Zorgeloos [2026-01-01 to 2026-02-01]"],
+            )
+        self.assertEqual(
+            self.names(description="Custom subscription text", **parent),
+            ["Custom subscription text [2026-01-01 to 2026-02-01]"],
+        )
+
+
 class TaxRuleTests(unittest.TestCase):
     worker = WorkerTests.worker
 
