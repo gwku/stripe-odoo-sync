@@ -29,7 +29,10 @@ def taxes_for(config, invoice, line):
             inclusive += tax["amount"]
         else:
             require(tax.get("tax_behavior") == "exclusive", "tax_behavior_required")
-    if not taxes:
+    if not taxes and invoice.get("total") == 0:
+        # A fully discounted invoice carries no tax, whatever the customer's tax status.
+        pass
+    elif not taxes:
         treatment = invoice.get("customer_tax_exempt", "none")
         require(treatment in config["no_tax"], "no_tax_treatment_mapping_required")
         mapping = config["no_tax"][treatment]

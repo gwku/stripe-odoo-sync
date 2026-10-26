@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import time
 from collections import defaultdict
+from decimal import Decimal
 
 from .core import Rejected, SyncError, date_of, digest, log, minor, object_id, relation_id, require
 from .matching import Matcher
@@ -34,7 +35,11 @@ class Worker:
                 "invalid_income_account",
             )
         zero_taxes = {identifier for ids in config["no_tax"].values() for identifier in ids}
-        for identifier in {*config["tax_map"].values(), *zero_taxes}:
+        for identifier in {
+            *config["tax_map"].values(),
+            *config.get("tax_rate_map", {}).values(),
+            *zero_taxes,
+        }:
             tax = self.odoo.one(
                 "account.tax",
                 identifier,
@@ -205,7 +210,6 @@ class Worker:
                 and sorted(line["tax_ids"]) == planned["tax_ids"][0][2],
                 "odoo_invoice_line_mapping_mismatch",
             )
-            from decimal import Decimal
 
             require(
                 all(
@@ -247,8 +251,25 @@ class Worker:
             lambda _: require(complete(), "action_not_complete"),
         )
 
+    def configured_taxes(self, lines):
+        """Stripe Tax creates a new tax-rate ID per invoice; map those by country and percentage."""
+        rules = self.config.get("tax_rate_map", {})
+        tax_map = dict(self.config["tax_map"])
+        for line in lines:
+            for tax in line.get("taxes") or []:
+                identifier = object_id((tax.get("tax_rate_details") or {}).get("tax_rate"))
+                if not identifier or identifier in tax_map or not rules:
+                    continue
+                rate = self.stripe.get(f"/v1/tax_rates/{identifier}")
+                key = f"{rate.get('country')}:{Decimal(str(rate.get('percentage'))).normalize():f}"
+                require(key in rules, "tax_rate_mapping_required")
+                tax_map[identifier] = rules[key]
+        return {**self.config, "tax_map": tax_map}
+
     def document(self, source, invoice, lines, partner, original=None):
-        values, expected = document_plan(self.config, source, invoice, lines, partner, original)
+        values, expected = document_plan(
+            self.configured_taxes(lines), source, invoice, lines, partner, original
+        )
         ref = values["ref"]
         # Expiring PDF links are presentation data, not document identity.
         fingerprint = digest(

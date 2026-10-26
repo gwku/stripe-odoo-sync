@@ -97,6 +97,8 @@ class FakeStripe:
         pass
 
     def get(self, path, params=None):
+        if path.startswith("/v1/tax_rates/"):
+            return {"id": path.rsplit("/", 1)[1], "country": "NL", "percentage": 21.0}
         return copy.deepcopy(next(item for item in self.invoices if path.endswith("/" + item["id"])))
 
     def list(self, path, params=None):
@@ -560,6 +562,36 @@ class WorkerTests(unittest.TestCase):
         result = self.worker().run()
         self.assertEqual(result["verified"], 1)
         self.assertEqual(result["failed"], 1)
+
+
+class TaxRuleTests(unittest.TestCase):
+    worker = WorkerTests.worker
+
+    def setUp(self):
+        WorkerTests.setUp(self)
+        self.stripe.lines[0]["taxes"][0]["tax_rate_details"]["tax_rate"] = "txr_per_invoice"
+
+    def test_unknown_tax_rate_id_is_mapped_by_country_and_percentage(self):
+        self.settings["tax_rate_map"] = {"NL:21": 5}
+        self.assertEqual(self.worker().run()["verified"], 1)
+        self.assertEqual(self.odoo.creates, 1)
+
+    def test_unknown_tax_rate_without_matching_rule_fails_without_writing(self):
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.settings["tax_rate_map"] = {"NL:9": 5}
+        self.assertEqual(self.worker().run()["failed"], 1)
+        self.assertEqual(self.odoo.creates, 0)
+
+    def test_fully_discounted_invoice_needs_no_tax_treatment(self):
+        self.settings["no_tax"] = {}
+        self.stripe.invoices[0].update(total=0, total_excluding_tax=0, amount_paid=0)
+        self.stripe.lines[0].update(taxes=[], discount_amounts=[{"amount": 10000}])
+        self.assertEqual(self.worker().run()["verified"], 1)
+
+    def test_untaxed_invoice_with_value_still_needs_a_treatment(self):
+        self.settings["no_tax"] = {}
+        self.stripe.lines[0]["taxes"] = []
+        self.assertEqual(self.worker().run()["failed"], 1)
 
 
 class MatchingTests(unittest.TestCase):
