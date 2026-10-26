@@ -588,6 +588,53 @@ class DescriptionTests(unittest.TestCase):
         )
 
 
+class DiscountTests(unittest.TestCase):
+    def plan(self, labels=None, **changes):
+        source = {**invoice(), "total_excluding_tax": 7500, "total": 9075}
+        item = {**line(), "discount_amounts": [{"amount": 2500, "discount": "di_1"}], **changes}
+        item["taxes"] = [{**item["taxes"][0], "amount": 1575}]
+        values, expected = document_plan(config(), source, source, [item], 6, discount_labels=labels)
+        return values["invoice_line_ids"], expected
+
+    def test_discount_becomes_a_negative_line_with_the_same_tax(self):
+        commands, expected = self.plan({"di_1": "WELCOME (25% off)"})
+        self.assertEqual([c[2]["name"] for c in commands], ["Service", "WELCOME (25% off)"])
+        self.assertEqual([c[2]["price_unit"] for c in commands], [100.0, -25.0])
+        self.assertEqual(commands[0][2]["tax_ids"], commands[1][2]["tax_ids"])
+        self.assertEqual(expected["net"], 7500)
+
+    def test_unlabelled_discount_falls_back_to_a_generic_name(self):
+        commands, _ = self.plan()
+        self.assertEqual(commands[1][2]["name"], "Discount")
+
+    def test_worker_labels_discounts_from_the_coupon_and_tolerates_unreadable_coupons(self):
+        class Stripe:
+            def get(self, path):
+                if path == "/v1/coupons/ok":
+                    return {"name": "FREE", "percent_off": 100.0}
+                raise Rejected("remote_http_403")
+
+        worker = Worker.__new__(Worker)
+        worker.stripe = Stripe()
+        lines = [
+            {
+                "discounts": [
+                    {"id": "di_ok", "source": {"coupon": "ok"}},
+                    {"id": "di_hidden", "source": {"coupon": "hidden"}},
+                    "di_not_expanded",
+                ]
+            }
+        ]
+        self.assertEqual(worker.discount_labels(lines), {"di_ok": "FREE (100% off)", "di_hidden": "Discount"})
+
+    def test_inclusive_tax_discounts_stay_netted(self):
+        source = {**invoice(), "total_excluding_tax": 6198, "total": 7500}
+        item = {**line(), "amount": 10000, "discount_amounts": [{"amount": 2500, "discount": "di_1"}]}
+        item["taxes"] = [{**item["taxes"][0], "amount": 1302, "tax_behavior": "inclusive"}]
+        values, _ = document_plan(config(), source, source, [item], 6)
+        self.assertEqual(len(values["invoice_line_ids"]), 1)
+
+
 class TaxRuleTests(unittest.TestCase):
     worker = WorkerTests.worker
 

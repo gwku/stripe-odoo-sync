@@ -43,7 +43,7 @@ def taxes_for(config, invoice, line):
     return sorted(mapping), dict(expected), inclusive
 
 
-def document_plan(config, source, invoice, lines, partner_id, original_move_id=None):
+def document_plan(config, source, invoice, lines, partner_id, original_move_id=None, discount_labels=None):
     credit = source.get("object") == "credit_note"
     currency = source["currency"].upper()
     require(currency in config["currencies"], "currency_mapping_required")
@@ -97,6 +97,13 @@ def document_plan(config, source, invoice, lines, partner_id, original_move_id=N
             period = line.get("period")
         if period:
             description += f" [{date_of(period['start'], config['timezone'])} to {date_of(period['end'], config['timezone'])}]"
+        gross = net + discount
+        # Show discounts as their own negative lines, like Stripe's invoice. Inclusive taxes stay netted.
+        separate = (
+            [item for item in line.get("discount_amounts", []) if item["amount"]] if not inclusive else []
+        )
+        if separate:
+            net = gross
         commands.append(
             [
                 0,
@@ -110,6 +117,20 @@ def document_plan(config, source, invoice, lines, partner_id, original_move_id=N
                 },
             ]
         )
+        for item in separate:
+            commands.append(
+                [
+                    0,
+                    0,
+                    {
+                        "name": (discount_labels or {}).get(item.get("discount"), "Discount"),
+                        "quantity": 1.0,
+                        "price_unit": float(-Decimal(item["amount"]) / factor),
+                        "account_id": account_id,
+                        "tax_ids": [[6, 0, tax_ids]],
+                    },
+                ]
+            )
     require(bool(commands), "empty_document_requires_review")
     require(net_total == source["total_excluding_tax"], "source_line_net_total_mismatch")
     require(net_total + sum(expected_taxes.values()) == source["total"], "source_line_gross_total_mismatch")

@@ -266,9 +266,35 @@ class Worker:
                 tax_map[identifier] = rules[key]
         return {**self.config, "tax_map": tax_map}
 
+    def discount_labels(self, lines):
+        """Label discount lines like Stripe's PDF, "<coupon name> (<n>% off)"; fall back to "Discount"."""
+        labels = {}
+        for line in lines:
+            for discount in line.get("discounts") or []:
+                if not isinstance(discount, dict) or discount["id"] in labels:
+                    continue
+                coupon = (discount.get("source") or {}).get("coupon")
+                label = "Discount"
+                try:
+                    coupon = self.stripe.get(f"/v1/coupons/{object_id(coupon)}") if coupon else None
+                except SyncError:
+                    coupon = None  # Restricted API keys may not read coupons.
+                if coupon and coupon.get("name"):
+                    label = coupon["name"]
+                    if coupon.get("percent_off"):
+                        label += f" ({Decimal(str(coupon['percent_off'])).normalize():f}% off)"
+                labels[discount["id"]] = label
+        return labels
+
     def document(self, source, invoice, lines, partner, original=None):
         values, expected = document_plan(
-            self.configured_taxes(lines), source, invoice, lines, partner, original
+            self.configured_taxes(lines),
+            source,
+            invoice,
+            lines,
+            partner,
+            original,
+            invoice.get("_discount_labels"),
         )
         ref = values["ref"]
         # Expiring PDF links are presentation data, not document identity.
@@ -522,7 +548,10 @@ class Worker:
             return
         require(invoice["status"] in ("open", "paid", "uncollectible"), "unsupported_invoice_status")
         pdf = self.fetch_pdf(invoice)
-        invoice["_lines"] = list(self.stripe.list(f"/v1/invoices/{invoice['id']}/lines"))
+        invoice["_lines"] = list(
+            self.stripe.list(f"/v1/invoices/{invoice['id']}/lines", {"expand[]": "data.discounts"})
+        )
+        invoice["_discount_labels"] = self.discount_labels(invoice["_lines"])
         partner = self.partner(invoice)
         move_id = self.document(invoice, invoice, invoice["_lines"], partner)
         if pdf is not None:
