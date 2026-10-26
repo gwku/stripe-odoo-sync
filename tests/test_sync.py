@@ -582,6 +582,15 @@ class DescriptionTests(unittest.TestCase):
                 self.names(description=description, **parent),
                 ["Zorgeloos [2026-01-01 to 2026-02-01]"],
             )
+        self.settings = {**config(), "period_separator": "tot"}
+        values, _ = document_plan(
+            self.settings,
+            invoice(),
+            invoice(),
+            [{**line(), "period": {"start": 1767222000, "end": 1769900400}, **parent}],
+            6,
+        )
+        self.assertTrue(values["invoice_line_ids"][0][2]["name"].endswith("[2026-01-01 tot 2026-02-01]"))
         self.assertEqual(
             self.names(description="Custom subscription text", **parent),
             ["Custom subscription text [2026-01-01 to 2026-02-01]"],

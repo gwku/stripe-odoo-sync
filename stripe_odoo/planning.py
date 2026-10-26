@@ -96,7 +96,7 @@ def document_plan(config, source, invoice, lines, partner_id, original_move_id=N
             description = wrapped.group(1) if wrapped else description
             period = line.get("period")
         if period:
-            description += f" [{date_of(period['start'], config['timezone'])} to {date_of(period['end'], config['timezone'])}]"
+            description += f" [{date_of(period['start'], config['timezone'])} {config.get('period_separator', 'to')} {date_of(period['end'], config['timezone'])}]"
         gross = net + discount
         # Show discounts as their own negative lines, like Stripe's invoice. Inclusive taxes stay netted.
         separate = (

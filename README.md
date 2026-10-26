@@ -145,6 +145,7 @@ example's IDs and date are placeholders, not an accounting configuration. Fill i
 | `currencies` | Currency code to `{odoo_id, decimals}`. Only explicitly configured currencies are accepted. Use Stripe's currency-specific exponent, checked against Odoo. |
 | `tax_map` | Stripe tax-rate ID to existing Odoo tax ID, e.g. `{"txr_example": 42}`. |
 | `tax_rate_map` | Optional `"<country>:<percentage>"` to Odoo tax ID, e.g. `{"NL:21": 42}`, for Stripe Tax, which creates a new tax-rate ID per invoice. Used only for tax-rate IDs missing from `tax_map`; an unmapped rate fails the invoice. |
+| `period_separator` | Optional word between the dates in a subscription line's period, default `to` (e.g. `tot` for Dutch). |
 | `no_tax` | Explicit treatment to Odoo tax-ID list. `{"none": []}` deliberately accepts ordinary untaxed sales; exempt and reverse-charge treatments require reporting tax IDs. |
 | `partner_map` | Optional Stripe customer ID to an existing Odoo partner ID. Use for migration matches and changed historical customer snapshots. |
 | `document_map` | Optional Stripe invoice/credit-note ID to an existing Odoo move ID, to resolve ambiguous migration matches. Financial verification still applies. |
